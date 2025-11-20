@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: mern-collaborative-editor
+    env: docker
+    dockerfilePath: server/Dockerfile
+    plan: starter
+    region: oregon
+    autoDeploy: true
+    # Note: Do NOT commit secrets here. Set MONGODB_URI and other secrets in the Render dashboard.
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "3001"
