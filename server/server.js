@@ -3,6 +3,9 @@ import express from 'express';
 import fetch from 'node-fetch';
 import http from 'http';
 import { WebSocketServer } from 'ws';
+import admin from 'firebase-admin';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import mongoose from 'mongoose';
 import cors from 'cors';
 import * as Y from 'yjs';
@@ -49,6 +52,63 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Basic security headers
+app.use(helmet());
+
+// Basic rate limiter for sensitive endpoints
+const execLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests, please slow down.' }
+});
+
+// Initialize Firebase Admin SDK if credentials are provided
+try {
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+        const svc = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+        admin.initializeApp({ credential: admin.credential.cert(svc) });
+        console.log('[Auth] firebase-admin initialized from FIREBASE_SERVICE_ACCOUNT');
+    } else {
+        // Attempt default initialization (e.g., GOOGLE_APPLICATION_CREDENTIALS set in env)
+        admin.initializeApp();
+        console.log('[Auth] firebase-admin initialized with default credentials');
+    }
+} catch (err) {
+    console.warn('[Auth] firebase-admin initialization failed or not configured:', err && err.message ? err.message : err);
+}
+
+// Middleware to verify Firebase ID tokens
+const verifyFirebaseToken = async (req, res, next) => {
+    const authHeader = req.headers.authorization || '';
+    if (!authHeader.startsWith('Bearer ')) {
+        // Development bypass: allow unauthenticated requests from localhost when NOT running in production
+        if (process.env.NODE_ENV !== 'production') {
+            console.warn('[Auth] Missing token — development bypass enabled');
+            req.user = { uid: 'dev-local', dev: true };
+            return next();
+        }
+        return res.status(401).json({ error: 'Unauthorized: missing token' });
+    }
+    const idToken = authHeader.split(' ')[1];
+    try {
+        if (!admin || !admin.auth) throw new Error('firebase-admin not configured');
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        req.user = decoded;
+        next();
+    } catch (err) {
+        // Development bypass if firebase-admin isn't configured or verification fails — allow in non-production environments
+        console.warn('[Auth] Token verification failed:', err && err.message ? err.message : err);
+        if (process.env.NODE_ENV !== 'production') {
+            console.warn('[Auth] Token verification failed — development bypass enabled');
+            req.user = { uid: 'dev-local', dev: true };
+            return next();
+        }
+        return res.status(401).json({ error: 'Unauthorized: invalid token' });
+    }
+};
+
 // Test endpoint
 app.get('/', (req, res) => {
     res.json({ message: 'Server is running' });
@@ -68,8 +128,8 @@ if (process.env.NODE_ENV === 'production') {
     }
 }
 
-// Code execution endpoint
-app.post('/api/execute', async (req, res) => {
+// Code execution endpoint (protected)
+app.post('/api/execute', execLimiter, verifyFirebaseToken, async (req, res) => {
     const { code, language, input } = req.body;
     console.log(`[${new Date().toISOString()}] Executing ${language} code:`, {
         code: code.slice(0, 100) + (code.length > 100 ? '...' : ''),
@@ -179,9 +239,56 @@ console.log('[Setup] Setting up WebSocket upgrade handler...');
 server.on('upgrade', (request, socket, head) => {
     try {
         console.log('[WebSocket] Upgrade request for:', request.url);
-        wss.handleUpgrade(request, socket, head, (ws) => {
-            wss.emit('connection', ws, request);
-        });
+
+        // Parse token from query string (e.g. ws://host:port/docId?token=...)
+        let token = null;
+        try {
+            const url = new URL(request.url, `http://${request.headers.host}`);
+            token = url.searchParams.get('token');
+        } catch (e) {
+            console.warn('[WebSocket] Could not parse upgrade URL for token', e && e.message ? e.message : e);
+        }
+
+        const proceedWithUpgrade = (decodedUser) => {
+            if (decodedUser) {
+                request.user = decodedUser;
+            }
+            wss.handleUpgrade(request, socket, head, (ws) => {
+                wss.emit('connection', ws, request);
+            });
+        };
+
+        if (token && admin && admin.auth) {
+            admin.auth().verifyIdToken(token)
+                .then(decoded => {
+                    console.log('[WebSocket] Token verified for uid:', decoded.uid);
+                    proceedWithUpgrade(decoded);
+                })
+                .catch(err => {
+                    console.warn('[WebSocket] Token verification failed:', err && err.message ? err.message : err);
+                    if (process.env.NODE_ENV !== 'production') {
+                        console.warn('[WebSocket] Development bypass: accepting connection without valid token');
+                        proceedWithUpgrade({ uid: 'dev-local', dev: true });
+                        return;
+                    }
+                    try {
+                        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+                    } catch (e) {}
+                    socket.destroy();
+                });
+        } else {
+            // No token provided
+            if (process.env.NODE_ENV !== 'production') {
+                console.warn('[WebSocket] No token provided in upgrade request — development bypass enabled');
+                proceedWithUpgrade({ uid: 'dev-local', dev: true });
+                return;
+            }
+            console.warn('[WebSocket] No token provided in upgrade request; rejecting');
+            try {
+                socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+            } catch (e) {}
+            socket.destroy();
+        }
     } catch (err) {
         console.error('[WebSocket] Upgrade error:', err);
         socket.destroy();
@@ -192,6 +299,11 @@ console.log('[Setup] Setting up WebSocket connection handler...');
 // WebSocket connection handler
 wss.on('connection', (ws, req) => {
     try {
+        // Attach authenticated user (if present from upgrade)
+        if (req && req.user) {
+            ws.user = req.user;
+            console.log('[WebSocket] Connection authenticated for uid:', req.user.uid);
+        }
         // Parse document ID from URL
         const docName = req.url.slice(1).split('?')[0];
         console.log('[WebSocket] New connection for document:', docName);

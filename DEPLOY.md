@@ -25,6 +25,7 @@ Render-specific (GitHub + Render) — single-container deploy
     - `MONGODB_URI` — MongoDB connection string
     - `CLIENT_URL` — (optional) your deployed client origin, e.g. `https://your-service.onrender.com`
     - `PORT` — (optional) default `3001`
+    - `FIREBASE_SERVICE_ACCOUNT` — (recommended) JSON string of your Firebase service account credentials. Alternatively set `GOOGLE_APPLICATION_CREDENTIALS` on the host and Render will pick it up.
   - Deploy. Render will build the Docker image and run the container.
 3. After deployment, Render will give you a public URL (https). Use that as your API and WS base URL:
   - API: `https://your-render-service.onrender.com`
@@ -39,6 +40,7 @@ Important env vars for server
 - `PORT` (optional) — default 3001
 - `MONGODB_URI` — MongoDB connection string (if you want persistence)
 - `CLIENT_URL` — optional comma-separated allowed client origins (e.g. https://myapp.example.com)
+ - `FIREBASE_SERVICE_ACCOUNT` — JSON string of Firebase service account credentials (or configure `GOOGLE_APPLICATION_CREDENTIALS` on the host).
 
 Option 2 — Deploy server and client separately
 - Server: Render, Fly.io, DigitalOcean App Platform, Railway (all support WebSockets). Use `node server.js` start command.
